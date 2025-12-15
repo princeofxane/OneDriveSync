@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,40 +17,37 @@ import (
 const tokenCacheFile = "onedrive_token.json"
 
 type TokenCache struct {
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token"`
-	ExpiresAt    time.Time `json:"expires_at"`
+	AccessToken string    `json:"access_token"`
+	ExpiresAt   time.Time `json:"expires_at"`
 }
 
 type DriveItem struct {
-	ID     string    `json:"id"`
-	Name   string    `json:"name"`
-	Size   int64     `json:"size"`
-	Folder *struct{} `json:"folder,omitempty"`
+	ID               string    `json:"id"`
+	Name             string    `json:"name"`
+	Size             int64     `json:"size"`
+	Folder           *struct{} `json:"folder,omitempty"`
+	LastModifiedTime string    `json:"lastModifiedDateTime"`
 }
 
 type DriveItemsResponse struct {
 	Value []DriveItem `json:"value"`
 }
 
-func main() {
-	clientID := "03f96d61-d0cb-4889-acd3-a62ed0e564b9"
-	tenantID := "consumers"
+type OneDriveClient struct {
+	token      string
+	httpClient *http.Client
+}
 
-	// Get access token (will use cache or prompt for login)
+func NewOneDriveClient(clientID, tenantID string) (*OneDriveClient, error) {
 	token, err := getAccessToken(clientID, tenantID)
 	if err != nil {
-		fmt.Printf("❌ Error getting token: %v\n", err)
-		return
+		return nil, err
 	}
 
-	fmt.Println("✅ Authenticated!\n")
-
-	// List files
-	err = listFiles(token)
-	if err != nil {
-		fmt.Printf("❌ Error: %v\n", err)
-	}
+	return &OneDriveClient{
+		token:      token,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}, nil
 }
 
 func getAccessToken(clientID, tenantID string) (string, error) {
@@ -60,21 +58,11 @@ func getAccessToken(clientID, tenantID string) (string, error) {
 			fmt.Println("🔄 Using cached token")
 			return cache.AccessToken, nil
 		}
-
-		// Try to refresh the token
-		if cache.RefreshToken != "" {
-			fmt.Println("🔄 Refreshing token...")
-			newToken, err := refreshAccessToken(clientID, tenantID, cache.RefreshToken)
-			if err == nil {
-				return newToken, nil
-			}
-			fmt.Println("⚠️  Token refresh failed, need to re-authenticate")
-		}
 	}
 
 	// Need fresh authentication
 	fmt.Println("🔐 Authenticating with OneDrive...")
-	fmt.Println("You will be prompted to sign in via your browser.\n")
+	fmt.Printf("You will be prompted to sign in via your browser.\n")
 
 	ctx := context.Background()
 	cred, err := azidentity.NewDeviceCodeCredential(&azidentity.DeviceCodeCredentialOptions{
@@ -98,19 +86,12 @@ func getAccessToken(clientID, tenantID string) (string, error) {
 
 	// Save token to cache
 	cache := TokenCache{
-		AccessToken:  tokenResp.Token,
-		RefreshToken: "", // Device code flow doesn't give us refresh token directly
-		ExpiresAt:    tokenResp.ExpiresOn,
+		AccessToken: tokenResp.Token,
+		ExpiresAt:   tokenResp.ExpiresOn,
 	}
 	saveTokenCache(cache)
 
 	return tokenResp.Token, nil
-}
-
-func refreshAccessToken(clientID, tenantID, refreshToken string) (string, error) {
-	// This would require implementing OAuth2 refresh flow manually
-	// For now, just return error to trigger re-auth
-	return "", fmt.Errorf("refresh not implemented")
 }
 
 func loadTokenCache() (TokenCache, error) {
@@ -132,109 +113,247 @@ func saveTokenCache(cache TokenCache) error {
 	return os.WriteFile(tokenCacheFile, data, 0600)
 }
 
-func listFiles(token string) error {
-	client := &http.Client{}
-
-	// Get drive info
-	req, _ := http.NewRequest("GET", "https://graph.microsoft.com/v1.0/me/drive", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("error getting drive: %w", err)
+// ListFiles lists files in a folder (use "" or "/" for root)
+func (c *OneDriveClient) ListFiles(folderPath string) ([]DriveItem, error) {
+	var url string
+	if folderPath == "" || folderPath == "/" {
+		url = "https://graph.microsoft.com/v1.0/me/drive/root/children"
+	} else {
+		url = fmt.Sprintf("https://graph.microsoft.com/v1.0/me/drive/root:/%s:/children", folderPath)
 	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	var driveInfo map[string]interface{}
-	json.Unmarshal(body, &driveInfo)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+c.token)
 
-	fmt.Printf("📁 Drive: %s\n", driveInfo["name"])
-	fmt.Printf("   ID: %s\n\n", driveInfo["id"])
-
-	// List files in root folder
-	fmt.Println("📂 Files in your OneDrive root folder:\n")
-
-	req, _ = http.NewRequest("GET", "https://graph.microsoft.com/v1.0/me/drive/root/children", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err = client.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("error listing files: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API error: %s", string(body))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
 
-	body, _ = io.ReadAll(resp.Body)
-
+	body, _ := io.ReadAll(resp.Body)
 	var itemsResp DriveItemsResponse
 	err = json.Unmarshal(body, &itemsResp)
 	if err != nil {
-		return fmt.Errorf("error parsing response: %w", err)
+		return nil, fmt.Errorf("parse error: %w", err)
 	}
 
-	items := itemsResp.Value
-	if len(items) == 0 {
-		fmt.Println("   (No files found)")
-		return nil
-	}
-
-	for i, item := range items {
-		if item.Folder != nil {
-			fmt.Printf("%d. 📁 %s (folder)\n", i+1, item.Name)
-		} else {
-			fmt.Printf("%d. 📄 %s (%d bytes)\n", i+1, item.Name, item.Size)
-		}
-	}
-
-	fmt.Printf("\n✅ Total items: %d\n", len(items))
-	return nil
+	return itemsResp.Value, nil
 }
 
-func downloadFile(token, filePath, localPath string) error {
-	client := &http.Client{}
-
-	url := fmt.Sprintf("https://graph.microsoft.com/v1.0/me/drive/root:/%s:/content", filePath)
+// DownloadFile downloads a file from OneDrive to local path
+func (c *OneDriveClient) DownloadFile(remotePath, localPath string) error {
+	url := fmt.Sprintf("https://graph.microsoft.com/v1.0/me/drive/root:/%s:/content", remotePath)
 	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+c.token)
 
-	resp, err := client.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("download request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("download failed %d: %s", resp.StatusCode, string(body))
+	}
+
 	out, err := os.Create(localPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("create file failed: %w", err)
 	}
 	defer out.Close()
 
 	_, err = io.Copy(out, resp.Body)
-	return err
+	if err != nil {
+		return fmt.Errorf("write file failed: %w", err)
+	}
+
+	fmt.Printf("✅ Downloaded: %s → %s\n", remotePath, localPath)
+	return nil
 }
 
-func deleteFile(token, filePath string) error {
-	client := &http.Client{}
+// CopyFile copies a file within OneDrive
+func (c *OneDriveClient) CopyFile(sourcePath, destinationFolder, newName string) error {
+	url := fmt.Sprintf("https://graph.microsoft.com/v1.0/me/drive/root:/%s:/copy", sourcePath)
 
-	url := fmt.Sprintf("https://graph.microsoft.com/v1.0/me/drive/root:/%s:", filePath)
-	req, _ := http.NewRequest("DELETE", url, nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	requestBody := map[string]interface{}{
+		"parentReference": map[string]string{
+			"path": "/drive/root:/" + destinationFolder,
+		},
+	}
 
-	resp, err := client.Do(req)
+	if newName != "" {
+		requestBody["name"] = newName
+	}
+
+	jsonBody, _ := json.Marshal(requestBody)
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("copy request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode != 202 && resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete failed: %s", string(body))
+		return fmt.Errorf("copy failed %d: %s", resp.StatusCode, string(body))
 	}
 
+	fmt.Printf("✅ Copied: %s → %s/%s\n", sourcePath, destinationFolder, newName)
 	return nil
+}
+
+// DeleteFile deletes a file from OneDrive
+func (c *OneDriveClient) DeleteFile(filePath string) error {
+	url := fmt.Sprintf("https://graph.microsoft.com/v1.0/me/drive/root:/%s:", filePath)
+	req, _ := http.NewRequest("DELETE", url, nil)
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 204 && resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete failed %d: %s", resp.StatusCode, string(body))
+	}
+
+	fmt.Printf("✅ Deleted: %s\n", filePath)
+	return nil
+}
+
+// MonitorFolder watches a folder for new files
+func (c *OneDriveClient) MonitorFolder(folderPath string, knownFiles map[string]bool) ([]DriveItem, error) {
+	items, err := c.ListFiles(folderPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var newFiles []DriveItem
+	for _, item := range items {
+		if !knownFiles[item.ID] {
+			newFiles = append(newFiles, item)
+			knownFiles[item.ID] = true
+		}
+	}
+
+	return newFiles, nil
+}
+
+func main() {
+	// Configuration
+	clientID := "CLIENT_ID_HERE" // Replace with your Azure app client ID
+	tenantID := "consumers"
+
+	// Folder to monitor
+	watchFolder := "Videos/Xbox Game DVR" // Change this to your folder, or "" for root
+	downloadDir := "./downloads"
+
+	// Create download directory if it doesn't exist
+	os.MkdirAll(downloadDir, 0755)
+
+	// Create OneDrive client
+	client, err := NewOneDriveClient(clientID, tenantID)
+	if err != nil {
+		fmt.Printf("❌ Failed to create client: %v\n", err)
+		return
+	}
+
+	fmt.Printf("\n✅ Connected to OneDrive!\n")
+
+	// Example 1: List files in a folder
+	fmt.Printf("📂 Files in '%s':\n", watchFolder)
+	files, err := client.ListFiles(watchFolder)
+	if err != nil {
+		fmt.Printf("❌ Error: %v\n", err)
+		return
+	}
+
+	for i, file := range files {
+		if file.Folder != nil {
+			fmt.Printf("%d. 📁 %s\n", i+1, file.Name)
+		} else {
+			fmt.Printf("%d. 📄 %s (%d bytes)\n", i+1, file.Name, file.Size)
+		}
+	}
+	fmt.Println()
+
+	// Example 2: Download a specific file
+	// Uncomment and modify as needed:
+	/*
+		err = client.DownloadFile("Documents/example.txt", "./downloads/example.txt")
+		if err != nil {
+			fmt.Printf("❌ Download error: %v\n", err)
+		}
+	*/
+
+	// Example 3: Copy a file
+	// Uncomment and modify as needed:
+	/*
+		err = client.CopyFile("Documents/example.txt", "Documents/Backup", "example_backup.txt")
+		if err != nil {
+			fmt.Printf("❌ Copy error: %v\n", err)
+		}
+	*/
+
+	// Example 4: Delete a file
+	// Uncomment and modify as needed:
+	/*
+		err = client.DeleteFile("Documents/old_file.txt")
+		if err != nil {
+			fmt.Printf("❌ Delete error: %v\n", err)
+		}
+	*/
+
+	// Example 5: Monitor for new files (automation use case)
+	fmt.Println("\n--- Monitoring Example ---")
+	knownFiles := make(map[string]bool)
+
+	// Initial scan - mark all current files as known
+	initialFiles, err := client.ListFiles(watchFolder)
+	if err != nil {
+		fmt.Printf("❌ Error: %v\n", err)
+		return
+	}
+
+	for _, file := range initialFiles {
+		knownFiles[file.ID] = true
+	}
+	fmt.Printf("📊 Tracking %d existing files\n", len(knownFiles))
+
+	// Check for new files (in production, you'd run this in a loop with time.Sleep)
+	newFiles, err := client.MonitorFolder(watchFolder, knownFiles)
+	if err != nil {
+		fmt.Printf("❌ Error: %v\n", err)
+		return
+	}
+
+	if len(newFiles) > 0 {
+		fmt.Printf("\n🆕 Found %d new file(s):\n", len(newFiles))
+		for _, file := range newFiles {
+			fmt.Printf("  - %s\n", file.Name)
+
+			// Auto-download new files
+			remotePath := watchFolder + "/" + file.Name
+			localPath := downloadDir + "/" + file.Name
+
+			err = client.DownloadFile(remotePath, localPath)
+			if err != nil {
+				fmt.Printf("    ❌ Download failed: %v\n", err)
+			}
+		}
+	} else {
+		fmt.Println("\n✓ No new files found")
+	}
 }
