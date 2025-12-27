@@ -1,0 +1,6 @@
+onedrive_config:
+  client_id: "fd968205-e70a-4414-ad2a-4d109d4ed5eb"
+  tenant_id: "consumers"
+directory_mappings:
+  - "Pictures/Xbox Screenshots:Xbox/Pictures"
+  - "Videos/Xbox Game DVR:Others/Xbox/Videos"
