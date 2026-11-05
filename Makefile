@@ -13,3 +13,6 @@ run-steal:
 
 run-validate:
 	go run main.go --mode validate
+
+mount-partition:
+	sudo mount -a
